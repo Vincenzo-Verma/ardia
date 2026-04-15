@@ -15,9 +15,9 @@ class Settings(BaseSettings):
     llm_model: str = "mistralai/Mistral-7B-Instruct-v0.3"
     llm_provider: str | None = None  # e.g. "featherless-ai", "together", "novita"
 
-    # Tracing
+    # Tracing — LangChain reads LANGSMITH_* env vars natively; no extra wiring needed
     langsmith_api_key: str
-    langsmith_project: str = "research-agent"
+    langsmith_project: str = "ardia"
 
     # Object storage — MinIO (S3-compatible)
     minio_endpoint: str = "http://minio:9000"
