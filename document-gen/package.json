@@ -1,0 +1,13 @@
+{
+  "name": "document-gen",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "DOCX generator for the research agent",
+  "main": "generate.js",
+  "scripts": {
+    "generate": "node generate.js"
+  },
+  "dependencies": {
+    "docx": "^8.5.0"
+  }
+}
