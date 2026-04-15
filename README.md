@@ -1,42 +1,72 @@
 # Ardia — Autonomous Research Agent
 
-Submits a natural-language question, runs a five-stage LangGraph pipeline, and returns a signed download link to a formatted DOCX report.
+Submit a natural-language question and receive a fully cited, formatted DOCX report. Ardia is not a chatbot — it runs a multi-stage agentic pipeline that plans, searches, evaluates evidence, and iteratively refines its output before rendering a document.
+
+## Why Ardia?
+
+| | Chatbot | Ardia |
+|---|---|---|
+| Output | Chat reply | Downloadable DOCX report |
+| Sources | Hallucinated or missing | Every claim cited, full bibliography |
+| Research depth | Single LLM call | Multi-stage pipeline with iterative gap-filling |
+| Source quality | Unknown | Scored on relevance, recency, and credibility |
+| Long jobs | Blocks the client | Async queue — API returns immediately |
+
+### Key features
+
+- **Self-refining gap loop** — after synthesis, the agent identifies unanswered sub-questions and loops back to retrieve more evidence, repeating until the report is complete or the depth limit is reached
+- **Evidence-first output** — every factual claim carries an inline source URL; a deduplicated bibliography is appended to every report
+- **3-dimensional quality filtering** — search results are scored on relevance, recency, and credibility; anything below a composite score of 0.6 is dropped before synthesis
+- **Model-agnostic** — swap the LLM with two env vars (`LLM_MODEL`, `LLM_PROVIDER`); works with any HuggingFace Inference API model or third-party provider
+- **Non-blocking jobs** — Celery + Redis queue; `POST /research` returns a `job_id` immediately, the client polls for completion
+- **Configurable depth** — `quick` / `standard` / `deep` modes control how many refinement iterations run (1 / 2 / 3)
+- **Real-time progress events** — each pipeline stage publishes structured events to Redis Pub/Sub as it runs
+- **Rate-limit-safe search** — concurrent DuckDuckGo queries are bounded by a semaphore and staggered to avoid triggering blocks
 
 ## Architecture
 
+```mermaid
+flowchart TB
+    Browser(["Browser"])
+
+    Browser -->|"POST /research"| API["FastAPI"]
+    API -->|"202  { job_id }"| Browser
+    API -->|enqueue| Redis[("Redis\nbroker + results")]
+    Redis --> Worker["Celery Worker"]
+
+    Worker --> Planner
+
+    subgraph Pipeline ["LangGraph Pipeline"]
+        direction TB
+        Planner["Planner\ndecompose into 3–5 sub-queries"]
+        Retriever["Retriever\nconcurrent DuckDuckGo search"]
+        Evaluator["Evaluator\nscore relevance · recency · credibility\nfilter composite &lt; 0.6"]
+        Synthesizer["Synthesizer\nstructured draft + citations + gap list"]
+        Formatter["Formatter\nrender DOCX · upload to MinIO"]
+
+        Planner --> Retriever
+        Retriever --> Evaluator
+        Evaluator --> Synthesizer
+        Synthesizer -->|"gaps remain & iterations &lt; max"| Retriever
+        Synthesizer -->|"no gaps or iterations = max"| Formatter
+    end
+
+    Formatter --> MinIO[("MinIO\nobject storage")]
+    MinIO -->|"presigned URL"| Worker
+    Worker -->|"store result"| Redis
+    Browser -->|"GET /research/{job_id}"| API
+    API -->|"{ status, output_url }"| Browser
 ```
-POST /research
-      │
-      ▼
-  Celery task
-      │
-      ▼
-┌─────────────────────────────────────────────┐
-│  LangGraph pipeline                         │
-│                                             │
-│  Planner → Retriever → Evaluator            │
-│                  ▲          │               │
-│                  │          ▼               │
-│             (gap loop)  Synthesizer         │
-│                              │              │
-│                              ▼              │
-│                          Formatter          │
-└─────────────────────────────────────────────┘
-      │
-      ▼
-  MinIO (S3-compatible)
-      │
-      ▼
-  Presigned URL → client
-```
+
+### Pipeline stages
 
 | Stage | What it does |
 |---|---|
-| **Planner** | Decomposes the question into 3–5 focused sub-queries |
-| **Retriever** | Searches the web concurrently for each sub-query (DuckDuckGo) |
-| **Evaluator** | Scores every result on relevance, recency, and credibility; filters composite < 0.6 |
-| **Synthesizer** | Produces a structured `ReportDraft` JSON; identifies unanswered gaps |
-| **Formatter** | Renders the draft to DOCX via a Node.js script, uploads to MinIO |
+| **Planner** | Decomposes the question into 3–5 focused sub-queries, each tagged with an intent (`factual`, `comparative`, or `recent`) |
+| **Retriever** | Searches DuckDuckGo concurrently for each sub-query with a per-query timeout and rate-limit backoff |
+| **Evaluator** | Scores every result on relevance, recency, and credibility (each 0–1); filters out results with composite score < 0.6 |
+| **Synthesizer** | Produces a structured `ReportDraft` with thematic sections, inline citations, and a list of knowledge gaps |
+| **Formatter** | Renders the draft to DOCX via a Node.js subprocess, uploads to MinIO, returns a 1-hour presigned URL |
 
 The synthesizer loops back to the retriever when gaps remain, up to the per-mode limit.
 
@@ -51,7 +81,7 @@ The synthesizer loops back to the retriever when gaps remain, up to the per-mode
 | Layer | Choice |
 |---|---|
 | Orchestration | LangGraph 0.2.x |
-| LLM | Any HuggingFace Inference API model (configurable) |
+| LLM | Any HuggingFace Inference API model (configurable via env) |
 | Web search | DuckDuckGo via LangChain Community |
 | Document generation | `docx` npm package (Node.js subprocess) |
 | Backend API | FastAPI + Python 3.12 |
@@ -146,24 +176,20 @@ Copy `.env.example` to `.env` and fill in the required values.
 | `ENVIRONMENT` | No | `development` | Set to `production` to restrict CORS |
 | `VITE_API_URL` | No | `http://localhost:8000` | Frontend → API base URL |
 
-## Swapping the LLM provider
+## Swapping the LLM
 
-All LLM calls go through [`backend/agent/llm.py`](backend/agent/llm.py). To switch providers, change the two lines inside `get_llm()`:
+All LLM calls go through [`backend/agent/llm.py`](backend/agent/llm.py). To use a different model, set `LLM_MODEL` (and optionally `LLM_PROVIDER`) in your `.env`:
 
-```python
-# HuggingFace (default)
-from langchain_huggingface import ChatHuggingFace, HuggingFaceEndpoint
+```bash
+# Any model on HuggingFace's own infrastructure
+LLM_MODEL=meta-llama/Llama-3.1-8B-Instruct
 
-# OpenAI
-from langchain_openai import ChatOpenAI
-return ChatOpenAI(model="gpt-4o", api_key=settings.openai_api_key)
-
-# Ollama (local)
-from langchain_ollama import ChatOllama
-return ChatOllama(model="llama3")
+# Model served by a third-party provider
+LLM_MODEL=Qwen/Qwen2.5-72B-Instruct
+LLM_PROVIDER=featherless-ai
 ```
 
-No other files need to change.
+To switch to a completely different LLM backend (OpenAI, Ollama, Bedrock, etc.), replace `_HFChatModel` in [`backend/agent/llm.py`](backend/agent/llm.py) with the appropriate LangChain `BaseChatModel` subclass. No other files need to change.
 
 ## Swapping to AWS S3
 
@@ -193,7 +219,7 @@ Poll job status.
 
 ```json
 // Done
-{ "job_id": "abc-123", "status": "done", "output_url": "http://minio:9000/..." }
+{ "job_id": "abc-123", "status": "done", "output_url": "http://localhost:9000/research-reports/..." }
 
 // Failed
 { "job_id": "abc-123", "status": "failed", "error": "..." }
