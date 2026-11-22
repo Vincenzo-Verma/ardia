@@ -2,19 +2,17 @@
 
 from __future__ import annotations
 
-import json
-import logging
-from typing import Any, Dict
+from typing import Any, Dict, Literal
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
+from pydantic import BaseModel
 
 from agent.events import publish
 from agent.llm import get_llm
 from agent.models import SubQuery
 from agent.state import AgentState
-
-logger = logging.getLogger(__name__)
+from agent.structured_output import invoke_structured
 
 _SYSTEM_PROMPT = (
     "You are a research planning assistant. Your job is to decompose a user's\n"
@@ -29,17 +27,13 @@ _SYSTEM_PROMPT = (
 )
 
 
-class PlannerError(RuntimeError):
-    """Raised when the planner fails to produce valid sub-queries after retries."""
+class _PlannerSubQuery(BaseModel):
+    text: str
+    intent: Literal["factual", "comparative", "recent"]
 
 
-def _parse_response(raw: str, question: str) -> list[SubQuery]:
-    """Parse and validate the LLM JSON response into a list of SubQuery objects."""
-    data = json.loads(raw)
-    return [
-        SubQuery(text=item["text"], intent=item["intent"], parent_question=question)
-        for item in data["sub_queries"]
-    ]
+class _PlannerResponse(BaseModel):
+    sub_queries: list[_PlannerSubQuery]
 
 
 async def run_planner(state: AgentState, config: RunnableConfig) -> Dict[str, Any]:
@@ -52,30 +46,11 @@ async def run_planner(state: AgentState, config: RunnableConfig) -> Dict[str, An
 
     llm = get_llm(max_new_tokens=1024)
     messages = [SystemMessage(content=_SYSTEM_PROMPT), HumanMessage(content=question)]
-    response = await llm.ainvoke(messages)
-    raw: str = response.content
-    logger.debug("Planner raw response: %s", raw)
-
-    try:
-        sub_queries = _parse_response(raw, question)
-    except Exception as first_err:
-        logger.warning("Planner first parse failed (%s); retrying.", first_err)
-        retry_messages = messages + [
-            response,
-            HumanMessage(content=(
-                f"Your previous response could not be parsed: {first_err}. "
-                "Output ONLY valid JSON matching the schema."
-            )),
-        ]
-        retry_response = await llm.ainvoke(retry_messages)
-        raw = retry_response.content
-        logger.debug("Planner retry raw response: %s", raw)
-        try:
-            sub_queries = _parse_response(raw, question)
-        except Exception as second_err:
-            raise PlannerError(
-                f"Planner failed to produce valid JSON after retry: {second_err}"
-            ) from second_err
+    parsed = await invoke_structured(llm, messages, _PlannerResponse, "planner")
+    sub_queries = [
+        SubQuery(text=item.text, intent=item.intent, parent_question=question)
+        for item in parsed.sub_queries
+    ]
 
     bullets = "\n".join(f'  • "{sq.text}"' for sq in sub_queries)
     await publish(job_id, {"type": "stage_done", "stage": "planner",
