@@ -8,13 +8,27 @@ from typing import Any, Dict, List
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
+from pydantic import BaseModel, Field
 
 from agent.events import publish
 from agent.llm import get_llm
 from agent.models import ScoredResult, SearchResult
 from agent.state import AgentState
+from agent.structured_output import invoke_structured
 
 logger = logging.getLogger(__name__)
+
+
+class _EvaluationScore(BaseModel):
+    url: str
+    relevance: float = Field(strict=True, ge=0, le=1)
+    recency: float = Field(strict=True, ge=0, le=1)
+    credibility: float = Field(strict=True, ge=0, le=1)
+
+
+class _EvaluatorResponse(BaseModel):
+    scores: List[_EvaluationScore]
+
 
 _SYSTEM_PROMPT = (
     "You are a research quality evaluator. Score each search result on three dimensions.\n"
@@ -50,12 +64,9 @@ async def run_evaluator(state: AgentState, config: RunnableConfig) -> Dict[str, 
         SystemMessage(content=_SYSTEM_PROMPT),
         HumanMessage(content=_build_user_message(search_results)),
     ]
-    response = await llm.ainvoke(messages)
-    raw: str = response.content
-    logger.debug("Evaluator raw response: %s", raw)
-    data = json.loads(raw)
+    data = await invoke_structured(llm, messages, _EvaluatorResponse, "evaluator")
 
-    score_map: Dict[str, Dict[str, float]] = {s["url"]: s for s in data["scores"]}
+    score_map: Dict[str, _EvaluationScore] = {score.url: score for score in data.scores}
 
     scored: List[ScoredResult] = []
     for r in search_results:
@@ -65,8 +76,8 @@ async def run_evaluator(state: AgentState, config: RunnableConfig) -> Dict[str, 
         scored.append(ScoredResult(
             sub_query=r.sub_query, url=r.url, title=r.title,
             snippet=r.snippet, fetched_at=r.fetched_at,
-            relevance=score["relevance"], recency=score["recency"],
-            credibility=score["credibility"],
+            relevance=score.relevance, recency=score.recency,
+            credibility=score.credibility,
         ))
 
     filtered = [s for s in scored if s.composite >= 0.6]

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import logging
 from typing import Any, Dict
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -11,10 +10,9 @@ from langchain_core.runnables import RunnableConfig
 
 from agent.events import publish
 from agent.llm import get_llm
-from agent.models import ReportDraft, ReportSection
+from agent.models import ReportDraft
 from agent.state import AgentState
-
-logger = logging.getLogger(__name__)
+from agent.structured_output import invoke_structured
 
 _SYSTEM_PROMPT = (
     "You are a research synthesis assistant. You receive a set of scored web search\n"
@@ -62,19 +60,7 @@ async def run_synthesizer(state: AgentState, config: RunnableConfig) -> Dict[str
 
     llm = get_llm(max_new_tokens=4096)
     messages = [SystemMessage(content=_SYSTEM_PROMPT), HumanMessage(content=_build_user_message(state))]
-    response = await llm.ainvoke(messages)
-    raw: str = response.content
-    logger.debug("Synthesizer raw response: %s", raw)
-    data = json.loads(raw)
-
-    sections = [
-        ReportSection(heading=s["heading"], body=s["body"], citations=s["citations"])
-        for s in data["sections"]
-    ]
-    draft = ReportDraft(
-        title=data["title"], sections=sections,
-        bibliography=data["bibliography"], gaps=data["gaps"], iteration=data["iteration"],
-    )
+    draft = await invoke_structured(llm, messages, ReportDraft, "synthesizer")
 
     if draft.gaps:
         gap_list = "\n".join(f'  • "{g}"' for g in draft.gaps)
